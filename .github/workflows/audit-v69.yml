@@ -1,5 +1,7 @@
 name: Audit v69
 on:
+  push:
+    branches: ["**"]
   pull_request:
     types: [opened, synchronize, reopened]
 
@@ -504,3 +506,5 @@ jobs:
           echo "=== V69 FINAL ==="
           echo "RT_HEX=$(cat /tmp/rt.txt | xxd -p | tr -d '\n')"
           echo "=== V69 COMPLETE ==="
+
+# RUN ID 1772730616.333741
